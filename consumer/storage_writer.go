@@ -1,12 +1,13 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -71,4 +72,64 @@ func (w *StorageWriter) Close() {
 
 func logInsertError(entry LogEntry, routingKey string, err error) {
 	log.Printf("failed to store log [%s] %s: %v", routingKey, entry.Service, err)
+}
+
+func RunStorageWriter(ctx context.Context, conn *amqp.Connection, writer *StorageWriter) error {
+	ch, err := conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	if err := ch.ExchangeDeclare(exchangeName, exchangeType, true, false, false, false, nil); err != nil {
+		return err
+	}
+
+	queue, err := ch.QueueDeclare(queueName, true, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	if err := ch.QueueBind(queue.Name, bindingKey, exchangeName, false, nil); err != nil {
+		return err
+	}
+
+	if err := ch.Qos(10, 0, false); err != nil {
+		return err
+	}
+
+	deliveries, err := ch.Consume(queue.Name, "storage-writer", false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	log.Println("storage_writer consuming from", queue.Name, "bound to", bindingKey)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("shutting down storage_writer")
+			return nil
+
+		case delivery, ok := <-deliveries:
+			if !ok {
+				return nil
+			}
+
+			var entry LogEntry
+			if err := json.Unmarshal(delivery.Body, &entry); err != nil {
+				log.Printf("failed to unmarshal message, discarding: %v", err)
+				delivery.Nack(false, false)
+				continue
+			}
+
+			if err := writer.Insert(ctx, entry, delivery.RoutingKey); err != nil {
+				logInsertError(entry, delivery.RoutingKey, err)
+				delivery.Nack(false, true)
+				continue
+			}
+
+			delivery.Ack(false)
+		}
+	}
 }

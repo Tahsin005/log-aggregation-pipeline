@@ -2,14 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
 
 const (
 	exchangeName = "logs_topic_exchange"
@@ -44,81 +45,30 @@ func main() {
 	}
 	defer conn.Close()
 
-	ch, err := conn.Channel()
+	alerter, err := NewAlerter(conn)
 	if err != nil {
-		log.Fatalf("failed to open channel: %v", err)
+		log.Fatalf("failed to set up alerter: %v", err)
 	}
-	defer ch.Close()
+	defer alerter.Close()
 
-	err = ch.ExchangeDeclare(exchangeName, exchangeType, true, false, false, false, nil)
-	if err != nil {
-		log.Fatalf("failed to declare exchange: %v", err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	queue, err := ch.QueueDeclare(
-		queueName,
-		true,  // durable — survives broker restart
-		false, // auto-delete
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	if err != nil {
-		log.Fatalf("failed to declare queue: %v", err)
-	}
-
-	err = ch.QueueBind(queue.Name, bindingKey, exchangeName, false, nil)
-	if err != nil {
-		log.Fatalf("failed to bind queue: %v", err)
-	}
-
-	err = ch.Qos(10, 0, false)
-	if err != nil {
-		log.Fatalf("failed to set QoS: %v", err)
-	}
-
-	deliveries, err := ch.Consume(
-		queue.Name,
-		"storage-writer", // consumer tag
-		false,            // autoAck — false, we ack manually after successful insert
-		false,            // exclusive
-		false,            // no-local
-		false,            // no-wait
-		nil,              // args
-	)
-	if err != nil {
-		log.Fatalf("failed to register consumer: %v", err)
-	}
-
-	log.Println("storage_writer consuming from", queue.Name, "bound to", bindingKey)
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("shutting down storage_writer")
-			return
-
-		case delivery, ok := <-deliveries:
-			if !ok {
-				log.Println("delivery channel closed")
-				return
-			}
-
-			var entry LogEntry
-			if err := json.Unmarshal(delivery.Body, &entry); err != nil {
-				log.Printf("failed to unmarshal message, discarding: %v", err)
-				// malformed message
-				delivery.Nack(false, false)
-				continue
-			}
-
-			if err := writer.Insert(ctx, entry, delivery.RoutingKey); err != nil {
-				logInsertError(entry, delivery.RoutingKey, err)
-				delivery.Nack(false, true)
-				continue
-			}
-
-			delivery.Ack(false)
+	go func() {
+		defer wg.Done()
+		if err := RunStorageWriter(ctx, conn, writer); err != nil {
+			log.Printf("storage_writer stopped with error: %v", err)
 		}
-	}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := alerter.Run(ctx); err != nil {
+			log.Printf("alerter stopped with error: %v", err)
+		}
+	}()
+
+	log.Println("consumer running: storage_writer + alerter (Ctrl+C to stop)")
+	wg.Wait()
+	log.Println("consumer shut down cleanly")
 }
