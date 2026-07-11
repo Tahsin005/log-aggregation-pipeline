@@ -164,6 +164,12 @@ func publishToFinalDLQ(ctx context.Context, ch *amqp.Channel, delivery amqp.Deli
 	publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
+	headers := amqp.Table{}
+	for k, v := range delivery.Headers {
+		headers[k] = v
+	}
+	headers["x-original-routing-key"] = delivery.RoutingKey
+
 	return ch.PublishWithContext(
 		publishCtx,
 		finalDLQExchangeName,
@@ -173,7 +179,7 @@ func publishToFinalDLQ(ctx context.Context, ch *amqp.Channel, delivery amqp.Deli
 			ContentType:  delivery.ContentType,
 			DeliveryMode: amqp.Persistent,
 			Timestamp:    time.Now(),
-			Headers:      delivery.Headers,
+			Headers:      headers,
 			Body:         delivery.Body,
 		},
 	)
